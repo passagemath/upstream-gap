@@ -1,0 +1,186 @@
+name: Run Sage CI
+
+## This GitHub Actions workflow provides:
+##
+##  - portability testing, by building and testing this project on many platforms
+##    (Linux variants)
+##
+##  - continuous integration, by building and testing other software
+##    that depends on this project.
+##
+## It runs on every push to the GitHub repository.
+##
+## The testing can be monitored in the "Actions" tab of the GitHub repository.
+##
+## After all jobs have finished (or are canceled) and a short delay,
+## tar files of all logs are made available as "build artifacts".
+##
+## This GitHub Actions workflow uses the portability testing framework
+## of SageMath (https://www.sagemath.org/).  For more information, see
+## https://doc.sagemath.org/html/en/developer/portability_testing.html
+
+## The workflow consists of two jobs:
+##
+##  - First, it builds a source distribution of the project
+##    and generates a script "update-pkgs.sh".  It uploads them
+##    as a build artifact named upstream.
+##
+##  - Second, it checks out a copy of the SageMath source tree.
+##    It downloads the upstream artifact and replaces the project's
+##    package in the SageMath distribution by the newly packaged one
+##    from the upstream artifact, by running the script "update-pkgs.sh".
+##    Then it builds a small portion of the Sage distribution.
+##
+## Many copies of the second step are run in parallel for each of the tested
+## systems/configurations.
+
+on:
+  pull_request:
+    branches:
+      - master
+  push:
+    tags:
+    branches:
+      - master
+      - "*ci-sage*"
+  workflow_dispatch:
+    # Allow to run manually
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  # Name of this project in the Sage distribution
+  SPKG:             gap
+  REMOVE_PATCHES:   "*"
+
+jobs:
+
+  dist:
+    runs-on: ubuntu-latest
+    steps:
+      ### Copied from release.yml, job "unix"
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # When an annotated tag is pushed, then for some reason we don't see it
+      # in this action; instead an unannotated tag with the same name is
+      # present, we resolve this by force-fetching tags.
+      # But we first fetch tags from gap-system/gap, so that our scripts should
+      # know about all of the 'usual' tags.
+      # Only then do we fetch tags from the current fork, which will overwrite
+      # any of those from gap-system/gap that conflict.
+      - name: "Force fetch tags"
+        run: |
+          git fetch https://github.com/gap-system/gap --tags --force
+          git fetch --tags --force
+
+      - name: "Install autoconf 2.72"   # for compatibility with GCC 14 & clang versions
+        run: |
+          wget https://ftp.gnu.org/gnu/autoconf/autoconf-2.72.tar.xz
+          tar xvf autoconf-2.72.tar.xz
+          cd autoconf-2.72
+          ./configure
+          make
+          sudo make install
+
+      - name: "Set up Python"
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: "Install some python packages"
+        run: |
+          python -m pip install -r dev/releases/requirements.txt
+      - name: "Install latex"
+        run: |
+          packages=(
+            texlive-latex-base
+            texlive-latex-recommended
+            texlive-latex-extra
+            texlive-fonts-recommended
+          )
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends "${packages[@]}"
+      - name: "Configure GAP"
+        run: dev/ci-configure-gap.sh
+      - name: "Build GAP"
+        run: dev/ci-build-gap.sh
+      - name: "Record the GAP build version"
+        id: get-build
+        run: |
+          BUILD=`head -1 cnf/GAP-VERSION-FILE | cut -d ' ' -f3`
+          echo "steps.get-build.outputs.name = ${BUILD}"
+          echo "name=${BUILD}" >> $GITHUB_OUTPUT
+      - name: "Make archives"
+        run: python -u ./dev/releases/make_archives.py
+
+      ### Up to here
+
+      - name: Prepare upstream artifact
+        run: |
+          mkdir -p upstream && cp tmp/gap-${{ steps.get-build.outputs.name }}.tar.gz upstream/ \
+          && echo "sage-package create ${{ env.SPKG }} --version ${{ steps.get-build.outputs.name }} --tarball ${{ env.SPKG }}-${{ steps.get-build.outputs.name }}.tar.gz --type=standard" > upstream/update-pkgs.sh \
+          && if [ -n "${{ env.REMOVE_PATCHES }}" ]; then echo 'for a in gap gap_packages; do (cd ../build/pkgs/$a/patches && rm -f ${{ env.REMOVE_PATCHES }}); done; :' >> upstream/update-pkgs.sh; fi \
+          && ls -l upstream/
+      - uses: actions/upload-artifact@v4
+        with:
+          path: upstream
+          name: upstream
+
+  linux:
+    uses: passagemath/passagemath/.github/workflows/docker.yml@main
+    with:
+      # Extra system packages to install. See available packages at
+      # https://github.com/passagemath/passagemath/tree/main/build/pkgs
+      extra_sage_packages: "patch cmake gfortran openblas"
+      # Sage distribution packages to build
+      targets: SAGE_CHECK=no SAGE_CHECK_PACKAGES="?gap" gap gap_packages
+      # Standard setting: Test the current HEAD of passagemath:
+      sage_repo: passagemath/passagemath
+      sage_ref: main
+      upstream_artifact: upstream
+      # Docker targets (stages) to tag
+      docker_targets: "with-targets"
+      # We prefix the image name with the SPKG name ("gap_") to avoid the error
+      # 'Package "sage-docker-..." is already associated with another repository.'
+      docker_push_repository: ghcr.io/${{ github.repository }}/gap_
+    needs: [dist]
+
+  macos:
+    uses: passagemath/passagemath/.github/workflows/macos.yml@main
+    with:
+      # Extra system packages to install. See available packages at
+      # https://github.com/passagemath/passagemath/tree/main/build/pkgs
+      extra_sage_packages: "patch cmake gfortran openblas"
+      # Sage distribution packages to build
+      targets: SAGE_CHECK=no SAGE_CHECK_PACKAGES="?gap" gap gap_packages
+      # Standard setting: Test the current HEAD of passagemath:
+      sage_repo: passagemath/passagemath
+      sage_ref: main
+      upstream_artifact: upstream
+    needs: [dist]
+
+  sage:
+    uses: passagemath/passagemath/.github/workflows/docker.yml@main
+    with:
+      # Standard setting: Test the current HEAD of passagemath:
+      sage_repo: passagemath/passagemath
+      sage_ref: main
+      upstream_artifact: upstream
+      # Build incrementally from published Docker image
+      incremental: true
+      free_disk_space: true
+      from_docker_repository: ghcr.io/passagemath/passagemath/
+      from_docker_target: "with-targets"
+      from_docker_tag: "dev"
+      docker_targets: "with-targets"
+      targets: "SAGE_CHECK_sagemath_gap=yes sagemath_gap"
+      tox_system_factors: >-
+        ["debian-bookworm"]
+      tox_packages_factors: >-
+        ["standard"]
+      docker_push_repository: ghcr.io/${{ github.repository }}/gap_
+    needs: [dist]
